@@ -9,6 +9,17 @@ The script supports both:
 - 2-time-point analysis
 - multi-time-point analysis
 
+## Get The Repository
+
+Clone with SSH:
+
+```bash
+git clone git@github.com:BJ-Chen-Eric/RTPCR.git
+cd RTPCR
+```
+
+From here, you can run the pipeline commands shown below.
+
 ## Run
 
 From repository root:
