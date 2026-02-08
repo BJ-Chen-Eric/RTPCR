@@ -1,0 +1,7 @@
+*.log
+*.tmp
+.Rhistory
+.RData
+__pycache__/
+.env
+≈

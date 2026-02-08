@@ -1,0 +1,24 @@
+Package: pipelineRpack
+Type: Package
+Title: RT-qPCR Unified Analysis Pipeline
+Version: 0.1.0
+Authors@R: person(given = "Eric", family = "Chen", role = c("aut", "cre"), email = "eric@example.com")
+Description: Package form of the RT-qPCR unified workflow for two-time-point and
+    multi-time-point analysis, including table exports and plot generation.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.2
+Imports:
+    data.table,
+    dplyr,
+    fs,
+    ggplot2,
+    openxlsx,
+    purrr,
+    scales,
+    seqinr,
+    stringr,
+    tibble,
+    tidyr,
+    cowplot

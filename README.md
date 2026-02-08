@@ -1,13 +1,60 @@
 # RT-qPCR Unified Pipeline (v2)
 
-This README is for:
+This README covers both:
 
 - `work_pp/rt_pct_strain_source_unified.R`
+- `pipeline_Rpack` (R package version)
 
 The script supports both:
 
 - 2-time-point analysis
 - multi-time-point analysis
+
+## R Package (pipelineRpack)
+
+Main entrypoints:
+
+- `pipelineRpack::run_rt_pct_strain_source_unified()`
+- `pipelineRpack::rt_pct_strain_source_unified_cli()`
+
+Install locally from package directory:
+
+```bash
+cd pipeline_v2/pipeline_Rpack
+R CMD INSTALL .
+```
+
+Install from GitHub (subdirectory package):
+
+```r
+install.packages("remotes")
+remotes::install_github("BJ-Chen-Eric/RTPCR", subdir = "pipeline_v2/pipeline_Rpack")
+```
+
+Private repo:
+
+```r
+Sys.setenv(GITHUB_PAT = "<your_token>")
+remotes::install_github("BJ-Chen-Eric/RTPCR", subdir = "pipeline_v2/pipeline_Rpack")
+```
+
+Run package function:
+
+```r
+pipelineRpack::run_rt_pct_strain_source_unified(
+  raw_dir = "RTpcr/raw",
+  pattern = "20260203b73lox.csv",
+  out_name = "output_test",
+  analysis_mode = "auto",
+  base_dir = getwd()
+)
+```
+
+Run package CLI wrapper:
+
+```bash
+Rscript pipeline_v2/pipeline_Rpack/inst/scripts/rt_pct_strain_source_unified.R --help
+```
 
 ## Get The Repository
 
