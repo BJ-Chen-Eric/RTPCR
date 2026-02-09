@@ -1007,23 +1007,42 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
   }
 
   plot_list <- list()
+  y_limits_by_mir <- list()
+  for (nm in names(plot_df_list)) {
+    meta_nm <- header_cleaning(nm, "_")
+    if (nrow(meta_nm) == 0 || !("V2" %in% colnames(meta_nm))) next
+    mir_nm <- as.character(meta_nm$V2[1])
+    y_top <- max(plot_df_list[[nm]]$y_max, na.rm = TRUE)
+    y_bottom <- min(plot_df_list[[nm]]$mean_fc - plot_df_list[[nm]]$sd_fc, na.rm = TRUE)
+    if (!is.finite(y_top)) y_top <- 1
+    if (!is.finite(y_bottom)) y_bottom <- -0.5
+    if (is.null(y_limits_by_mir[[mir_nm]])) {
+      y_limits_by_mir[[mir_nm]] <- c(y_bottom, y_top)
+    } else {
+      y_limits_by_mir[[mir_nm]] <- c(
+        min(y_limits_by_mir[[mir_nm]][1], y_bottom, na.rm = TRUE),
+        max(y_limits_by_mir[[mir_nm]][2], y_top, na.rm = TRUE)
+      )
+    }
+  }
+
   for (i in names(plot_df_list)) {
     plot_df <- plot_df_list[[i]]
     if (is.null(plot_df) || nrow(plot_df) < 2) next
 
-    if (analysis_mode == "multi" && multi_compare_style == "all_time") {
-      ymax <- max(plot_df$y_max, na.rm = TRUE)
+    mir <- i %>% header_cleaning("_") %>% pull(V2)
+    mir <- as.character(mir[1])
+    limits <- y_limits_by_mir[[mir]]
+    if (is.null(limits)) {
+      ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
+      min_y <- min(plot_df$mean_fc - plot_df$sd_fc, na.rm = TRUE)
     } else {
-      mir <- i %>% header_cleaning("_") %>% pull(V2)
-      ymax <- plot_df_list[grep(mir, names(plot_df_list))] %>%
-        lapply(function(x) max(x$y_max, na.rm = TRUE)) %>%
-        unlist() %>%
-        max(na.rm = TRUE)
+      min_y <- limits[1]
+      ymax <- limits[2]
     }
-
-    min_y <- min(plot_df$mean_fc - plot_df$sd_fc, na.rm = TRUE)
     if (is.na(min_y) || min_y > -0.5) min_y <- -0.5
-    if (!is.finite(ymax)) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
+    if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
+    if (!is.finite(ymax) || ymax <= 0) ymax <- 1
 
     plot_df <- plot_df %>%
       mutate(
