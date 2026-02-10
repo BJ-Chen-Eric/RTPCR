@@ -217,7 +217,7 @@ safe_t_test_p <- function(df, group_col = "p") {
 }
 
 p_to_stars <- function(pval) {
-  if (is.na(pval)) return("ns")
+  if (!is.finite(pval)) return("NA")
   dplyr::case_when(
     pval <= 0.001 ~ "***",
     pval <= 0.01  ~ "**",
@@ -1009,21 +1009,44 @@ main <- function() {
     if (is.na(min_y) || min_y > -0.5) min_y <- -0.5
     if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
     if (!is.finite(ymax) || ymax <= 0) ymax <- 1
+    y_span <- ymax - min_y
+    if (!is.finite(y_span) || y_span <= 0) y_span <- 1
 
     plot_df <- plot_df %>%
       mutate(
-        time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+")))
+        time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+"))),
+        mean_label = sprintf("%.2f", mean_fc),
+        mean_label_y = -0.2
       ) %>%
       arrange(ifelse(str_detect(p, paste0("_", control_time, "$")), -Inf, time_num), p)
     plot_df$p <- factor(plot_df$p, levels = plot_df$p)
+    raw_points <- result_time_list[[i]] %>%
+      mutate(
+        fold_change_num = suppressWarnings(as.numeric(fold_change)),
+        p = factor(p, levels = levels(plot_df$p))
+      ) %>%
+      filter(is.finite(fold_change_num))
 
     p <-
       ggplot(plot_df, aes(x = p, y = mean_fc)) +
       geom_col(width = 0.6, fill = "#d57500") +
+      geom_point(
+        data = raw_points,
+        aes(x = p, y = fold_change_num),
+        inherit.aes = FALSE,
+        position = position_jitter(width = 0.08, height = 0),
+        size = 2.2,
+        alpha = 0.8,
+        color = "black"
+      ) +
       geom_errorbar(
         aes(ymin = mean_fc - sd_fc, ymax = mean_fc + sd_fc),
         width = 0.15,
         linewidth = 0.8
+      ) +
+      geom_text(
+        aes(y = mean_label_y, label = mean_label),
+        size = 6
       ) +
       scale_y_continuous(limits = c(min_y, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
       labs(x = "Sample", y = "Fold Change", title = paste(i, "Fold Change", sep = ", ")) +
@@ -1033,7 +1056,7 @@ main <- function() {
     if (nrow(plot_df) == 2 && !is.na(plot_df$stars[1])) {
       p <- p +
         annotate("segment", x = 1, xend = 2, y = plot_df$bracket_y[1], yend = plot_df$bracket_y[1], linewidth = 0.7) +
-        annotate("text", x = 1.5, y = plot_df$stars_y[1], label = plot_df$stars[1], size = 12)
+        annotate("text", x = 1.5, y = plot_df$stars_y[1], label = plot_df$stars[1], size = 8)
     } else if (nrow(plot_df) > 2) {
       control_label <- plot_df$p[which(str_detect(as.character(plot_df$p), paste0("_", control_time, "$")))[1]]
       if (!is.na(control_label)) {
@@ -1053,7 +1076,7 @@ main <- function() {
             x = stars_df$p,
             y = stars_df$stars_y + 0.05,
             label = stars_df$stars,
-            size = 12
+            size = 8
           )
         }
       }
