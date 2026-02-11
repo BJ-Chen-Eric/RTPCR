@@ -293,11 +293,171 @@ panel_name_from_result_key <- function(keys, mode = "auto", perspective = "miR")
   meta$V2
 }
 
+build_analysis_status_tables <- function(all_raw, all_time, result_time_list, control_time, selected_file_paths, identified_target_genes, control_gene) {
+  if (nrow(all_raw) == 0) {
+    empty <- data.frame()
+    return(list(
+      run_summary = empty,
+      gene_summary = empty,
+      sample_gene_status = empty
+    ))
+  }
+
+  c_num <- suppressWarnings(as.numeric(str_extract(control_time, "[0-9]+")))
+  valid_expr <- if (nrow(all_time) > 0) {
+    is.finite(all_time$con) & is.finite(all_time$gene) & all_time$con < 40 & all_time$gene < 40
+  } else {
+    logical(0)
+  }
+
+  # Pair-level status used for fold-change pass/fail (target genes only).
+  target_sample_gene_status <- if (nrow(all_time) > 0) {
+    all_time %>%
+      mutate(valid_for_fc = valid_expr) %>%
+      group_by(strain, miR) %>%
+      summarise(
+        rows_detected = n(),
+        rows_valid_for_fc = sum(valid_for_fc, na.rm = TRUE),
+        time_points_detected = n_distinct(hr),
+        time_points_valid = n_distinct(hr[valid_for_fc]),
+        has_valid_control_time = if (is.na(c_num)) NA else any(hr == c_num & valid_for_fc, na.rm = TRUE),
+        has_valid_non_control_time = if (is.na(c_num)) NA else any(hr != c_num & valid_for_fc, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      rename(sample = strain, gene = miR)
+  } else {
+    data.frame(
+      sample = character(0),
+      gene = character(0),
+      rows_detected = integer(0),
+      rows_valid_for_fc = integer(0),
+      time_points_detected = integer(0),
+      time_points_valid = integer(0),
+      has_valid_control_time = logical(0),
+      has_valid_non_control_time = logical(0),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  passed_pairs <- data.frame(sample = character(0), gene = character(0), stringsAsFactors = FALSE)
+  if (length(result_time_list) > 0) {
+    passed_pairs <- names(result_time_list) %>%
+      header_cleaning("_") %>%
+      transmute(sample = as.character(V1), gene = as.character(V2)) %>%
+      distinct()
+  }
+
+  target_sample_gene_status <- target_sample_gene_status %>%
+    left_join(
+      passed_pairs %>% mutate(passed_analysis = TRUE),
+      by = c("sample", "gene")
+    ) %>%
+    mutate(
+      passed_analysis = ifelse(is.na(passed_analysis), FALSE, passed_analysis)
+    )
+
+  # Detailed per-sample/time/gene status (includes control gene).
+  control_time_status <- all_raw %>%
+    group_by(Sample_name, Time) %>%
+    summarise(
+      has_valid_control_at_same_sample_time = any(Gene == control_gene & is.finite(Ct) & Ct < 40, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  sample_gene_status <- all_raw %>%
+    mutate(valid_ct = is.finite(Ct) & Ct < 40) %>%
+    group_by(Sample_name, Time, Gene) %>%
+    summarise(
+      rows_detected = n(),
+      rows_valid_ct = sum(valid_ct, na.rm = TRUE),
+      median_ct = suppressWarnings(median(Ct[valid_ct], na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      gene_role = ifelse(Gene == control_gene, "control_gene", "target_gene")
+    ) %>%
+    left_join(
+      control_time_status,
+      by = c("Sample_name", "Time")
+    ) %>%
+    rename(sample = Sample_name, time = Time, gene = Gene) %>%
+    left_join(
+      target_sample_gene_status %>% select(sample, gene, passed_analysis),
+      by = c("sample", "gene")
+    ) %>%
+    mutate(
+      passed_analysis = ifelse(gene_role == "control_gene", NA, ifelse(is.na(passed_analysis), FALSE, passed_analysis)),
+      status = case_when(
+        gene_role == "control_gene" & rows_valid_ct > 0 ~ "control_detected",
+        gene_role == "control_gene" & rows_valid_ct == 0 ~ "control_missing_or_invalid",
+        gene_role == "target_gene" & rows_valid_ct == 0 ~ "target_no_valid_ct",
+        gene_role == "target_gene" & !has_valid_control_at_same_sample_time ~ "missing_valid_control_same_sample_time",
+        gene_role == "target_gene" & isTRUE(passed_analysis) ~ "passed",
+        gene_role == "target_gene" & !isTRUE(passed_analysis) ~ "not_passed_after_filters_or_replicates",
+        TRUE ~ "unknown"
+      )
+    ) %>%
+    arrange(sample, time, gene_role, gene)
+
+  gene_summary <- target_sample_gene_status %>%
+    group_by(gene) %>%
+    summarise(
+      samples_detected = n_distinct(sample),
+      sample_gene_pairs_detected = n(),
+      sample_gene_pairs_valid = sum(rows_valid_for_fc > 0, na.rm = TRUE),
+      sample_gene_pairs_passed = sum(passed_analysis, na.rm = TRUE),
+      passed_in_any_sample = any(passed_analysis),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(passed_in_any_sample), gene)
+
+  run_summary <- data.frame(
+    metric = c(
+      "input_files",
+      "samples_detected",
+      "target_genes_identified",
+      "sample_gene_pairs_detected",
+      "target_genes_passed_any_sample",
+      "sample_gene_pairs_passed"
+    ),
+    value = c(
+      length(selected_file_paths),
+      length(unique(sample_gene_status$sample)),
+      length(unique(identified_target_genes)),
+      nrow(target_sample_gene_status),
+      sum(gene_summary$passed_in_any_sample, na.rm = TRUE),
+      sum(target_sample_gene_status$passed_analysis, na.rm = TRUE)
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    run_summary = run_summary,
+    gene_summary = gene_summary,
+    sample_gene_status = sample_gene_status
+  )
+}
+
 main <- function() {
   args <- parse_cli_args(commandArgs(trailingOnly = TRUE))
   if (isTRUE(args$help)) {
     print_usage()
     return(invisible(NULL))
+  }
+
+  run_started_at <- Sys.time()
+  execution_log_lines <- character(0)
+  append_execution_log <- function(...) {
+    ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    line <- paste0(ts, " | ", paste0(..., collapse = ""))
+    execution_log_lines <<- c(execution_log_lines, line)
+    message("[exec] ", line)
+  }
+  flush_execution_log <- function(out_dir_path) {
+    if (!dir.exists(out_dir_path)) return(invisible(NULL))
+    log_path <- file.path(out_dir_path, "execution_log.txt")
+    writeLines(execution_log_lines, con = log_path, useBytes = TRUE)
+    message("[ok] Wrote execution log: ", log_path)
   }
 
   source(file.path(script_dir, "functions_rt.R"))
@@ -410,6 +570,9 @@ main <- function() {
   message("[config] sample_name_mode: ", sample_name_mode)
   message("[config] exclude_samples: ", ifelse(length(exclude_samples) == 0, "<none>", paste(exclude_samples, collapse = ", ")))
   message("[config] max_sample: ", max_sample)
+  append_execution_log("Pipeline started")
+  append_execution_log("analysis_mode=", analysis_mode, ", multi_compare_style=", multi_compare_style, ", control_time=", control_time)
+  append_execution_log("input_files(", length(selected_file_paths), "): ", paste(basename(selected_file_paths), collapse = ", "))
 
   filter_csv <- list()
   file_labels <- make.unique(tools::file_path_sans_ext(basename(selected_file_paths)))
@@ -629,6 +792,7 @@ main <- function() {
   miR_df <- all %>% filter(Gene != control_gene)
   miR <- unique(miR_df$Gene)
   miR <- miR[!miR %in% c(toupper(control_gene), "5.8S", "U6", "")]
+  identified_target_genes <- sort(unique(miR))
   sample <- sample[!sample %in% c("")]
   sample <- sample[!str_detect(sample, regex("standard$", ignore_case = TRUE))]
   time_points <- sort(unique(all$Time))
@@ -646,6 +810,7 @@ main <- function() {
     analysis_mode <- ifelse(length(time_points) == 2, "two", "multi")
     message("[auto] analysis_mode resolved to: ", analysis_mode)
   }
+  append_execution_log("samples_detected=", length(sample), ", target_genes_identified=", length(identified_target_genes), ", time_points=", paste(time_points, collapse = ","))
   if (analysis_mode != "multi" && multi_compare_style != "pairwise") {
     message("[warn] --multi-compare-style is only used in multi mode; falling back to pairwise.")
     multi_compare_style <- "pairwise"
@@ -859,6 +1024,46 @@ main <- function() {
   write_workbook_if_nonempty(result_raw_time, file.path(out_dir, "all_raw_time_results.xlsx"))
   write_workbook_if_nonempty(result_time_list, file.path(out_dir, "all_time_results.xlsx"))
 
+  analysis_tables <- build_analysis_status_tables(
+    all_raw = all,
+    all_time = all_time,
+    result_time_list = result_time_list,
+    control_time = control_time,
+    selected_file_paths = selected_file_paths,
+    identified_target_genes = identified_target_genes,
+    control_gene = control_gene
+  )
+  utils::write.csv(
+    analysis_tables$gene_summary,
+    file.path(out_dir, "analysis_gene_summary.csv"),
+    row.names = FALSE
+  )
+  utils::write.csv(
+    analysis_tables$sample_gene_status,
+    file.path(out_dir, "analysis_sample_gene_status.csv"),
+    row.names = FALSE
+  )
+  legacy_summary_csv <- file.path(out_dir, "analysis_summary.csv")
+  if (file.exists(legacy_summary_csv)) {
+    file.remove(legacy_summary_csv)
+    message("[ok] Removed run-summary CSV (using gene summary only): ", legacy_summary_csv)
+  }
+  legacy_summary_xlsx <- file.path(out_dir, "analysis_summary.xlsx")
+  if (file.exists(legacy_summary_xlsx)) {
+    file.remove(legacy_summary_xlsx)
+    message("[ok] Removed legacy summary workbook: ", legacy_summary_xlsx)
+  }
+  append_execution_log(
+    "target_genes_passed_any_sample=",
+    sum(analysis_tables$gene_summary$passed_in_any_sample, na.rm = TRUE),
+    ", sample_gene_pairs_passed=",
+    analysis_tables$run_summary$value[analysis_tables$run_summary$metric == "sample_gene_pairs_passed"],
+    ", sample_gene_pairs_detected=",
+    analysis_tables$run_summary$value[analysis_tables$run_summary$metric == "sample_gene_pairs_detected"],
+    ", detailed_sample_time_gene_rows=",
+    nrow(analysis_tables$sample_gene_status)
+  )
+
   if (length(result_time_list) == 0) {
     message("[warn] No time-comparison result sheets were generated; using fallback plotting from raw delta values.")
 
@@ -942,6 +1147,9 @@ main <- function() {
     message("[done] Pipeline completed.")
     message("[done] Excel outputs in: ", out_dir)
     message("[done] Figure outputs in: ", figure_dir)
+    append_execution_log("Pipeline completed with fallback plotting")
+    append_execution_log("duration_seconds=", round(as.numeric(difftime(Sys.time(), run_started_at, units = "secs")), 2))
+    flush_execution_log(out_dir)
     return(invisible(NULL))
   }
 
@@ -1090,6 +1298,9 @@ main <- function() {
     message("[done] Pipeline completed.")
     message("[done] Excel outputs in: ", out_dir)
     message("[done] Figure outputs in: ", figure_dir)
+    append_execution_log("Pipeline completed without figure outputs")
+    append_execution_log("duration_seconds=", round(as.numeric(difftime(Sys.time(), run_started_at, units = "secs")), 2))
+    flush_execution_log(out_dir)
     return(invisible(NULL))
   }
 
@@ -1140,6 +1351,9 @@ main <- function() {
   message("[done] Pipeline completed.")
   message("[done] Excel outputs in: ", out_dir)
   message("[done] Figure outputs in: ", figure_dir)
+  append_execution_log("Pipeline completed with figures")
+  append_execution_log("duration_seconds=", round(as.numeric(difftime(Sys.time(), run_started_at, units = "secs")), 2))
+  flush_execution_log(out_dir)
 }
 
 main()
