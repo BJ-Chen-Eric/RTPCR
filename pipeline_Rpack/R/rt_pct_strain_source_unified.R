@@ -31,6 +31,11 @@ print_usage <- function() {
     "  --exclude-samples CSV   Comma-separated sample names to exclude from analysis\n",
     "  --max-sample N          max_sample for drop_outliers_by_group (default: 3)\n",
     "  --sample-order CSV      Optional order for combined plots; unspecified strains are still included\n",
+    "  --color COLOR           Direct plot color (hex like #1f77b4 or R color name like 'steelblue')\n",
+    "  --color-family NAME     Color family for random palette (red/blue/green/orange/purple/teal/pink/gray)\n",
+    "  --color-seed N          Random seed for reproducible color palette (optional)\n",
+    "  --color-count N         Number of colors to generate in the family palette (default: 12)\n",
+    "  --color-index N         1-based color index from generated palette for bars (default: 1)\n",
     "  --help                  Show this help\n",
     sep = ""
   )
@@ -82,6 +87,18 @@ parse_int <- function(x, default) {
   n <- suppressWarnings(as.integer(x))
   if (is.na(n)) stop("Invalid integer value: ", x)
   n
+}
+
+parse_color_value <- function(x) {
+  if (is.null(x)) return(NULL)
+  val <- trimws(as.character(x))
+  if (!nzchar(val)) return(NULL)
+  ok <- TRUE
+  tryCatch(grDevices::col2rgb(val), error = function(e) ok <<- FALSE)
+  if (!ok) {
+    stop("Invalid --color value '", val, "'. Use hex like #1f77b4 or a valid R color name.")
+  }
+  val
 }
 
 normalize_sample_name <- function(x) {
@@ -270,6 +287,71 @@ make_vertical_plot_grid <- function(plots) {
   cowplot::plot_grid(plotlist = plots, ncol = 1)
 }
 
+generate_family_palette <- function(family = "orange", n = 12, seed = NA_integer_) {
+  family <- tolower(trimws(as.character(family)))
+  hue_ranges <- list(
+    red = c(350, 20),
+    blue = c(205, 245),
+    green = c(95, 145),
+    orange = c(20, 50),
+    purple = c(265, 305),
+    teal = c(165, 195),
+    pink = c(315, 345),
+    gray = c(0, 360)
+  )
+  if (!(family %in% names(hue_ranges))) {
+    stop("Unknown --color-family '", family, "'. Choose one of: ", paste(names(hue_ranges), collapse = ", "))
+  }
+  if (!is.finite(n) || n < 1) stop("--color-count must be >= 1")
+
+  old_seed <- NULL
+  if (is.finite(seed)) {
+    if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+    }
+    set.seed(as.integer(seed))
+    on.exit({
+      if (!is.null(old_seed)) {
+        assign(".Random.seed", old_seed, envir = .GlobalEnv)
+      } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+        rm(".Random.seed", envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+  }
+
+  hr <- hue_ranges[[family]]
+  if (family == "gray") {
+    lum <- runif(n, min = 30, max = 85)
+    cols <- grDevices::hcl(h = 0, c = 0, l = lum)
+  } else if (hr[1] <= hr[2]) {
+    hue <- runif(n, min = hr[1], max = hr[2])
+    chr <- runif(n, min = 50, max = 85)
+    lum <- runif(n, min = 35, max = 75)
+    cols <- grDevices::hcl(h = hue, c = chr, l = lum)
+  } else {
+    w1 <- 360 - hr[1]
+    w2 <- hr[2]
+    from_hi <- runif(n) < (w1 / (w1 + w2))
+    hue <- ifelse(from_hi, runif(n, hr[1], 360), runif(n, 0, hr[2]))
+    chr <- runif(n, min = 50, max = 85)
+    lum <- runif(n, min = 35, max = 75)
+    cols <- grDevices::hcl(h = hue, c = chr, l = lum)
+  }
+
+  # Expose index in light -> dark order.
+  rgb_mat <- grDevices::col2rgb(cols)
+  luma <- 0.2126 * rgb_mat[1, ] + 0.7152 * rgb_mat[2, ] + 0.0722 * rgb_mat[3, ]
+  cols <- cols[order(luma, decreasing = TRUE)]
+
+  data.frame(
+    color_index = seq_len(n),
+    color_hex = cols,
+    color_family = family,
+    color_seed = ifelse(is.finite(seed), as.integer(seed), NA_integer_),
+    stringsAsFactors = FALSE
+  )
+}
+
 panel_name_from_result_key <- function(keys, mode = "auto", perspective = "miR") {
   meta <- header_cleaning(keys, "_")
   if (nrow(meta) == 0) return(character(0))
@@ -307,7 +389,11 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
       sample_name_mode = "sample-name-mode",
       exclude_samples = "exclude-samples",
       max_sample = "max-sample",
-      sample_order = "sample-order"
+      sample_order = "sample-order",
+      color_family = "color-family",
+      color_seed = "color-seed",
+      color_count = "color-count",
+      color_index = "color-index"
     )
     nms <- names(x)
     hit <- nms %in% names(alias_map)
@@ -394,6 +480,13 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
   }
   max_sample <- parse_int(args$`max-sample`, default = 3)
   if (max_sample < 1) stop("--max-sample must be >= 1")
+  color_value <- parse_color_value(args$color)
+  color_family <- if (!is.null(args$`color-family`)) tolower(trimws(args$`color-family`)) else "orange"
+  color_seed <- parse_int(args$`color-seed`, default = NA_integer_)
+  color_count <- parse_int(args$`color-count`, default = 12)
+  color_index <- parse_int(args$`color-index`, default = 1)
+  if (color_count < 1) stop("--color-count must be >= 1")
+  if (color_index < 1 || color_index > color_count) stop("--color-index must be within 1..--color-count")
 
   sample_order <- character(0)
   if (!is.null(args$`sample-order`)) {
@@ -444,6 +537,20 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
   message("[config] sample_name_mode: ", sample_name_mode)
   message("[config] exclude_samples: ", ifelse(length(exclude_samples) == 0, "<none>", paste(exclude_samples, collapse = ", ")))
   message("[config] max_sample: ", max_sample)
+  message("[config] color: ", ifelse(is.null(color_value), "<none>", color_value))
+  message("[config] color_family: ", color_family)
+  message("[config] color_seed: ", ifelse(is.finite(color_seed), as.character(color_seed), "<none>"))
+  message("[config] color_count: ", color_count)
+  message("[config] color_index: ", color_index)
+
+  color_palette <- generate_family_palette(color_family, color_count, color_seed)
+  default_bar_fill_color <- color_palette$color_hex[[color_index]]
+  bar_fill_color <- if (!is.null(color_value)) color_value else default_bar_fill_color
+  utils::write.csv(color_palette, file.path(out_dir, "plot_color_index.csv"), row.names = FALSE)
+  message(
+    "[config] final_plot_color: ", bar_fill_color,
+    " (family=", color_family, ", index=", color_index, ")"
+  )
 
   filter_csv <- list()
   file_labels <- make.unique(tools::file_path_sans_ext(basename(selected_file_paths)))
@@ -929,7 +1036,7 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
 
         fallback_strain_plots[[st]] <-
           ggplot(sub, aes(x = panel_key, y = mean_fc)) +
-          geom_col(width = 0.6, fill = "#d57500") +
+          geom_col(width = 0.6, fill = bar_fill_color) +
           geom_errorbar(
             aes(ymin = pmax(0, mean_fc - ifelse(is.na(sd_fc), 0, sd_fc)),
                 ymax = mean_fc + ifelse(is.na(sd_fc), 0, sd_fc)),
@@ -1063,7 +1170,7 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
 
     p <-
       ggplot(plot_df, aes(x = p, y = mean_fc)) +
-      geom_col(width = 0.6, fill = "#d57500") +
+      geom_col(width = 0.6, fill = bar_fill_color) +
       geom_point(
         data = raw_points,
         aes(x = p, y = fold_change_num),
