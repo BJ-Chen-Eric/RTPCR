@@ -270,6 +270,22 @@ make_vertical_plot_grid <- function(plots) {
   cowplot::plot_grid(plotlist = plots, ncol = 1)
 }
 
+integer_axis_breaks <- function(y_min, y_max, max_ticks = 8) {
+  lo <- suppressWarnings(floor(as.numeric(y_min)))
+  hi <- suppressWarnings(ceiling(as.numeric(y_max)))
+  if (!is.finite(lo) || !is.finite(hi)) return(NULL)
+  if (lo == hi) return(lo)
+  span <- hi - lo
+  if (span <= 0) return(lo)
+  # Keep integer ticks but avoid crowded labels.
+  candidate_steps <- c(1, 2, 3, 4, 5, 10, 20, 25, 50, 100)
+  step <- candidate_steps[which.max((span / candidate_steps) <= max_ticks)]
+  if (!is.finite(step) || length(step) == 0 || step <= 0) {
+    step <- max(1, ceiling(span / max_ticks))
+  }
+  seq(lo, hi, by = step)
+}
+
 panel_name_from_result_key <- function(keys, mode = "auto", perspective = "miR") {
   meta <- header_cleaning(keys, "_")
   if (nrow(meta) == 0) return(character(0))
@@ -926,6 +942,8 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
 
         ymax <- max(sub$mean_fc + ifelse(is.na(sub$sd_fc), 0, sub$sd_fc), na.rm = TRUE)
         if (!is.finite(ymax) || ymax <= 0) ymax <- 1
+        y_min_int <- 0
+        y_max_int <- ceiling(ymax * 1.2)
 
         fallback_strain_plots[[st]] <-
           ggplot(sub, aes(x = panel_key, y = mean_fc)) +
@@ -936,14 +954,20 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
             width = 0.15,
             linewidth = 0.8
           ) +
-          scale_y_continuous(limits = c(0, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+          scale_y_continuous(
+            limits = c(y_min_int, y_max_int),
+            breaks = integer_axis_breaks(y_min_int, y_max_int)
+          ) +
           labs(
             x = "miR and Time",
             y = "2^-deltaCt",
             title = paste("Fallback (Strain)", toupper(st))
           ) +
           theme_bw() + gg_theme +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 20)
+          )
       }
 
       for (nm in names(fallback_strain_plots)) {
@@ -951,7 +975,7 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
         save_plot_if_nonempty(
           fallback_strain_plots[[nm]],
           file.path(figure_dir, paste0("fallback_strain_", nm_safe, ".png")),
-          width = 10, height = 7
+          width = 16, height = 9
         )
       }
 
@@ -1040,17 +1064,19 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
       min_y <- limits[1]
       ymax <- limits[2]
     }
-    if (is.na(min_y) || min_y > -0.5) min_y <- -0.5
+    if (is.na(min_y) || min_y > -1) min_y <- -1
     if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
     if (!is.finite(ymax) || ymax <= 0) ymax <- 1
     y_span <- ymax - min_y
     if (!is.finite(y_span) || y_span <= 0) y_span <- 1
+    y_min_int <- floor(min_y)
+    y_max_int <- ceiling(ymax * 1.2)
 
     plot_df <- plot_df %>%
       mutate(
         time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+"))),
         mean_label = sprintf("%.2f", mean_fc),
-        mean_label_y = -0.2
+        mean_label_y = -0.75
       ) %>%
       arrange(ifelse(str_detect(p, paste0("_", control_time, "$")), -Inf, time_num), p)
     plot_df$p <- factor(plot_df$p, levels = plot_df$p)
@@ -1082,10 +1108,16 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
         aes(y = mean_label_y, label = mean_label),
         size = 6
       ) +
-      scale_y_continuous(limits = c(min_y, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+      scale_y_continuous(
+        limits = c(y_min_int, y_max_int),
+        breaks = integer_axis_breaks(y_min_int, y_max_int)
+      ) +
       labs(x = "Sample", y = "Fold Change", title = paste(i, "Fold Change", sep = ", ")) +
       theme_bw() + gg_theme +
-      theme(axis.title.x = element_blank())
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 20)
+      )
 
     if (nrow(plot_df) == 2 && !is.na(plot_df$stars[1])) {
       p <- p +
