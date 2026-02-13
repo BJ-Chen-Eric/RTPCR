@@ -241,6 +241,18 @@ safe_t_test_p <- function(df, group_col = "p") {
   pval
 }
 
+safe_t_test_two_vectors <- function(x, y) {
+  x <- suppressWarnings(as.numeric(x))
+  y <- suppressWarnings(as.numeric(y))
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  tryCatch(
+    t.test(x, y, var.equal = FALSE, alternative = "two.sided")$p.value,
+    error = function(e) NA_real_
+  )
+}
+
 p_to_stars <- function(pval) {
   if (!is.finite(pval)) return("NA")
   dplyr::case_when(
@@ -249,6 +261,11 @@ p_to_stars <- function(pval) {
     pval <= 0.05  ~ "*",
     TRUE          ~ "ns"
   )
+}
+
+format_p_label <- function(pval, digits = 3) {
+  if (!is.finite(pval)) return("")
+  sprintf(paste0("%.", as.integer(digits), "f"), as.numeric(pval))
 }
 
 write_workbook_if_nonempty <- function(data_list, path) {
@@ -1232,6 +1249,197 @@ main <- function() {
     ", detailed_sample_time_gene_rows=",
     nrow(analysis_tables$sample_gene_status)
   )
+
+  # Pairwise time-point tests for each strain-gene across all detected times.
+  c_num <- suppressWarnings(as.numeric(str_extract(control_time, "[0-9]+")))
+  pairwise_input <- all_time %>%
+    filter(is.finite(con), is.finite(gene), con < 40, gene < 40) %>%
+    mutate(
+      hr = suppressWarnings(as.numeric(hr)),
+      time_label = ifelse(is.finite(hr), paste0(as.integer(hr), "h"), as.character(hr)),
+      pre_fold_change = 2^(-delta)
+    ) %>%
+    filter(is.finite(hr), nzchar(time_label))
+
+  if (nrow(pairwise_input) > 0 && is.finite(c_num)) {
+    pairwise_input <- pairwise_input %>%
+      group_by(strain, miR) %>%
+      mutate(
+        control = mean(pre_fold_change[hr == c_num], na.rm = TRUE),
+        fold_change = pre_fold_change / control
+      ) %>%
+      ungroup() %>%
+      filter(is.finite(fold_change))
+  } else {
+    pairwise_input$fold_change <- NA_real_
+  }
+
+  pairwise_rows <- list()
+  pairwise_matrix_list <- list()
+  heatmap_rows <- list()
+  pair_idx <- 1
+
+  if (nrow(pairwise_input) > 0) {
+    pairwise_groups <- pairwise_input %>%
+      group_by(strain, miR) %>%
+      group_split()
+
+    for (df_g in pairwise_groups) {
+      if (nrow(df_g) == 0) next
+      strain_name <- as.character(df_g$strain[1])
+      gene_name <- as.character(df_g$miR[1])
+
+      time_order <- sort(unique(df_g$hr))
+      if (length(time_order) < 2) next
+      time_labels <- paste0(as.integer(time_order), "h")
+      comb <- utils::combn(seq_along(time_order), 2)
+      if (is.null(dim(comb)) || ncol(comb) == 0) next
+
+      group_rows <- vector("list", ncol(comb))
+      for (k in seq_len(ncol(comb))) {
+        i1 <- comb[1, k]
+        i2 <- comb[2, k]
+        t1 <- time_order[i1]
+        t2 <- time_order[i2]
+        l1 <- time_labels[i1]
+        l2 <- time_labels[i2]
+
+        x <- df_g$fold_change[df_g$hr == t1]
+        y <- df_g$fold_change[df_g$hr == t2]
+        pval <- safe_t_test_two_vectors(x, y)
+
+        group_rows[[k]] <- data.frame(
+          strain = strain_name,
+          gene = gene_name,
+          time_a = l1,
+          time_b = l2,
+          n_a = sum(is.finite(x)),
+          n_b = sum(is.finite(y)),
+          mean_a = ifelse(sum(is.finite(x)) > 0, mean(x, na.rm = TRUE), NA_real_),
+          mean_b = ifelse(sum(is.finite(y)) > 0, mean(y, na.rm = TRUE), NA_real_),
+          p_value = pval,
+          p_stars = format_p_label(pval, digits = 3),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      group_df <- dplyr::bind_rows(group_rows)
+      if (nrow(group_df) == 0) next
+      group_df <- group_df %>%
+        mutate(
+          p_adj_bh = p.adjust(p_value, method = "BH"),
+          p_adj_stars = vapply(p_adj_bh, format_p_label, character(1), digits = 3)
+        )
+      pairwise_rows[[pair_idx]] <- group_df
+      pair_idx <- pair_idx + 1
+
+      m <- matrix(NA_real_, nrow = length(time_labels), ncol = length(time_labels), dimnames = list(time_labels, time_labels))
+      for (k in seq_len(nrow(group_df))) {
+        a <- group_df$time_a[k]
+        b <- group_df$time_b[k]
+        p <- group_df$p_value[k]
+        m[a, b] <- p
+        m[b, a] <- p
+      }
+      pairwise_matrix_list[[paste(strain_name, gene_name, sep = "_")]] <- as.data.frame(m, stringsAsFactors = FALSE)
+
+      heat_df <- expand.grid(
+        strain = strain_name,
+        gene = gene_name,
+        time_a = time_labels,
+        time_b = time_labels,
+        stringsAsFactors = FALSE
+      ) %>%
+        mutate(
+          p_value = NA_real_,
+          p_stars = ""
+        )
+      for (k in seq_len(nrow(group_df))) {
+        a <- group_df$time_a[k]
+        b <- group_df$time_b[k]
+        p <- group_df$p_value[k]
+        s <- group_df$p_stars[k]
+        heat_df$p_value[heat_df$time_a == a & heat_df$time_b == b] <- p
+        heat_df$p_value[heat_df$time_a == b & heat_df$time_b == a] <- p
+        heat_df$p_stars[heat_df$time_a == a & heat_df$time_b == b] <- s
+        heat_df$p_stars[heat_df$time_a == b & heat_df$time_b == a] <- s
+      }
+      heatmap_rows[[paste(strain_name, gene_name, sep = "_")]] <- heat_df
+    }
+  }
+
+  if (length(pairwise_rows) > 0) {
+    pairwise_table <- dplyr::bind_rows(pairwise_rows) %>%
+      arrange(strain, gene, time_a, time_b)
+    utils::write.csv(
+      pairwise_table,
+      file.path(out_dir, "pairwise_time_tests.csv"),
+      row.names = FALSE
+    )
+    write_workbook_if_nonempty(
+      pairwise_matrix_list,
+      file.path(out_dir, "pairwise_time_test_matrix.xlsx")
+    )
+
+    if (length(heatmap_rows) > 0) {
+      heatmap_df <- dplyr::bind_rows(heatmap_rows, .id = "panel") %>%
+        mutate(
+          panel = gsub("_", "-", panel),
+          p_plot = p_value
+        )
+
+      panel_n <- dplyr::n_distinct(heatmap_df$panel)
+      ncol_wrap <- max(1, min(4, ceiling(sqrt(panel_n))))
+      nrow_wrap <- ceiling(panel_n / ncol_wrap)
+      heatmap_plot <- ggplot(heatmap_df, aes(x = time_a, y = time_b, fill = p_plot)) +
+        geom_tile(color = "white", linewidth = 0.3) +
+        geom_text(aes(label = p_stars), size = 4) +
+        scale_fill_gradientn(
+          colors = c("#b2182b", "white", "#2166ac"),
+          values = scales::rescale(log10(c(0.001, 0.05, 1)), from = log10(c(0.001, 1))),
+          trans = "log10",
+          limits = c(0.001, 1),
+          breaks = c(0.001, 0.05, 1),
+          labels = scales::label_number(accuracy = 0.001),
+          oob = scales::squish,
+          na.value = "grey90",
+          guide = guide_colorbar(
+            reverse = TRUE,
+            barheight = grid::unit(7, "cm"),
+            barwidth = grid::unit(0.8, "cm")
+          )
+        ) +
+        facet_wrap(~panel, ncol = ncol_wrap) +
+        labs(
+          x = "Time",
+          y = "Time",
+          fill = "p-value\n",
+          title = "Pairwise Time-Point Tests by Strain and Gene"
+        ) +
+        theme_bw() +
+        gg_theme +
+        theme(
+          axis.text.x = element_text(angle = 0, hjust = 1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          panel.grid = element_blank()
+        )
+      save_plot_if_nonempty(
+        heatmap_plot,
+        file.path(figure_dir, "pairwise_time_test_heatmap.png"),
+        width = max(10, 4.5 * ncol_wrap),
+        height = max(6, 3.8 * nrow_wrap)
+      )
+    }
+
+    append_execution_log(
+      "pairwise_time_tests_rows=", nrow(pairwise_table),
+      ", pairwise_groups=", length(pairwise_matrix_list)
+    )
+  } else {
+    message("[warn] Pairwise time-point tests skipped: insufficient data across time points.")
+    append_execution_log("pairwise_time_tests_rows=0, pairwise_groups=0")
+  }
 
   if (length(result_time_list) == 0) {
     message("[warn] No time-comparison result sheets were generated; using fallback plotting from raw delta values.")
