@@ -22,6 +22,7 @@ print_usage <- function() {
     "  --control-gene GENE     Control gene name (auto: 5.8S then TUB)\n",
     "  --perform-calibration   true/false, apply cross-file Ct calibration (default: false)\n",
     "  --calibration-sample S  Sample_name used for calibration (auto: '*standard*' common across files)\n",
+    "  --calibration-rep N     Replicate index used for calibration Ct (optional)\n",
     "  --calibration-gene G    Gene used for calibration (default: control gene)\n",
     "  --calibration-time T    Time used for calibration (default: 0h)\n",
     "  --control-time T        Control time point for 2-time comparison (default: 0h)\n",
@@ -287,6 +288,21 @@ make_vertical_plot_grid <- function(plots) {
   cowplot::plot_grid(plotlist = plots, ncol = 1)
 }
 
+integer_axis_breaks <- function(y_min, y_max, max_ticks = 8) {
+  lo <- suppressWarnings(floor(as.numeric(y_min)))
+  hi <- suppressWarnings(ceiling(as.numeric(y_max)))
+  if (!is.finite(lo) || !is.finite(hi)) return(NULL)
+  if (lo == hi) return(lo)
+  span <- hi - lo
+  if (span <= 0) return(lo)
+  candidate_steps <- c(1, 2, 3, 4, 5, 10, 20, 25, 50, 100)
+  step <- candidate_steps[which.max((span / candidate_steps) <= max_ticks)]
+  if (!is.finite(step) || length(step) == 0 || step <= 0) {
+    step <- max(1, ceiling(span / max_ticks))
+  }
+  seq(lo, hi, by = step)
+}
+
 generate_family_palette <- function(family = "orange", n = 12, seed = NA_integer_) {
   family <- tolower(trimws(as.character(family)))
   hue_ranges <- list(
@@ -381,6 +397,7 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
       control_gene = "control-gene",
       perform_calibration = "perform-calibration",
       calibration_sample = "calibration-sample",
+      calibration_rep = "calibration-rep",
       calibration_gene = "calibration-gene",
       calibration_time = "calibration-time",
       control_time = "control-time",
@@ -453,9 +470,11 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
   control_gene <- if (!is.null(control_gene_arg)) toupper(control_gene_arg) else NULL
   perform_calibration <- parse_bool(args$`perform-calibration`, default = FALSE)
   calibration_sample_user <- args$`calibration-sample`
+  calibration_rep_user <- args$`calibration-rep`
   calibration_gene_user <- args$`calibration-gene`
   calibration_time_user <- args$`calibration-time`
   calibration_sample <- if (!is.null(calibration_sample_user)) normalize_sample_name(calibration_sample_user) else NULL
+  calibration_rep <- parse_int(calibration_rep_user, default = NA_integer_)
   calibration_gene <- if (!is.null(calibration_gene_user)) toupper(calibration_gene_user) else NULL
   calibration_time <- if (!is.null(calibration_time_user)) calibration_time_user else "0h"
   control_time <- if (!is.null(args$`control-time`)) args$`control-time` else "0h"
@@ -684,44 +703,43 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
 
   message("[config] control_gene: ", control_gene)
   message("[config] calibration_sample: ", ifelse(is.null(calibration_sample), "<none>", calibration_sample))
+  message("[config] calibration_rep: ", ifelse(is.finite(calibration_rep), as.character(calibration_rep), "<none>"))
   message("[config] calibration_gene: ", calibration_gene)
   message("[config] calibration_time: ", calibration_time)
 
+  calibration_ct_mean <- function(df, sample_name, time_name, gene_name, rep_idx = NA_integer_) {
+    q <- df %>%
+      filter(
+        Sample_name == sample_name,
+        Time == time_name,
+        Gene == gene_name,
+        Ct != 100
+      )
+    if (is.finite(rep_idx)) q <- q %>% filter(rep == rep_idx)
+    mean(q$Ct, na.rm = TRUE)
+  }
+
   if (perform_calibration && length(filter_csv) > 1) {
     ref_name <- names(filter_csv)[1]
-    ref_ct <- filter_csv[[ref_name]] %>%
-      filter(
-        Sample_name == calibration_sample,
-        Time == calibration_time,
-        Gene == calibration_gene,
-        Ct != 100
-      ) %>%
-      pull(Ct) %>%
-      mean(na.rm = TRUE)
+    ref_ct <- calibration_ct_mean(filter_csv[[ref_name]], calibration_sample, calibration_time, calibration_gene, calibration_rep)
 
     if (!is.finite(ref_ct)) {
       stop(
         "Calibration failed: no valid reference Ct in file '", ref_name,
-        "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time
+        "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time,
+        if (is.finite(calibration_rep)) paste0(", rep=", calibration_rep) else ""
       )
     }
 
     for (k in 2:length(filter_csv)) {
       nm <- names(filter_csv)[k]
-      cur_ct <- filter_csv[[nm]] %>%
-        filter(
-          Sample_name == calibration_sample,
-          Time == calibration_time,
-          Gene == calibration_gene,
-          Ct != 100
-        ) %>%
-        pull(Ct) %>%
-        mean(na.rm = TRUE)
+      cur_ct <- calibration_ct_mean(filter_csv[[nm]], calibration_sample, calibration_time, calibration_gene, calibration_rep)
 
       if (!is.finite(cur_ct)) {
         stop(
           "Calibration failed: no valid Ct in file '", nm,
-          "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time
+          "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time,
+          if (is.finite(calibration_rep)) paste0(", rep=", calibration_rep) else ""
         )
       }
 
@@ -1033,6 +1051,8 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
 
         ymax <- max(sub$mean_fc + ifelse(is.na(sub$sd_fc), 0, sub$sd_fc), na.rm = TRUE)
         if (!is.finite(ymax) || ymax <= 0) ymax <- 1
+        y_min_int <- 0
+        y_max_int <- ceiling(ymax * 1.2)
 
         fallback_strain_plots[[st]] <-
           ggplot(sub, aes(x = panel_key, y = mean_fc)) +
@@ -1043,14 +1063,20 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
             width = 0.15,
             linewidth = 0.8
           ) +
-          scale_y_continuous(limits = c(0, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+          scale_y_continuous(
+            limits = c(y_min_int, y_max_int),
+            breaks = integer_axis_breaks(y_min_int, y_max_int)
+          ) +
           labs(
             x = "miR and Time",
             y = "2^-deltaCt",
             title = paste("Fallback (Strain)", toupper(st))
           ) +
           theme_bw() + gg_theme +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 20)
+          )
       }
 
       for (nm in names(fallback_strain_plots)) {
@@ -1058,7 +1084,7 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
         save_plot_if_nonempty(
           fallback_strain_plots[[nm]],
           file.path(figure_dir, paste0("fallback_strain_", nm_safe, ".png")),
-          width = 10, height = 7
+          width = 16, height = 9
         )
       }
 
@@ -1147,17 +1173,19 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
       min_y <- limits[1]
       ymax <- limits[2]
     }
-    if (is.na(min_y) || min_y > -0.5) min_y <- -0.5
+    if (is.na(min_y) || min_y > -1) min_y <- -1
     if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
     if (!is.finite(ymax) || ymax <= 0) ymax <- 1
     y_span <- ymax - min_y
     if (!is.finite(y_span) || y_span <= 0) y_span <- 1
+    y_min_int <- floor(min_y)
+    y_max_int <- ceiling(ymax * 1.2)
 
     plot_df <- plot_df %>%
       mutate(
         time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+"))),
         mean_label = sprintf("%.2f", mean_fc),
-        mean_label_y = -0.2
+        mean_label_y = -0.75
       ) %>%
       arrange(ifelse(str_detect(p, paste0("_", control_time, "$")), -Inf, time_num), p)
     plot_df$p <- factor(plot_df$p, levels = plot_df$p)
@@ -1189,10 +1217,16 @@ run_rt_pct_strain_source_unified <- function(args = NULL, base_dir = getwd(), ..
         aes(y = mean_label_y, label = mean_label),
         size = 6
       ) +
-      scale_y_continuous(limits = c(min_y, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+      scale_y_continuous(
+        limits = c(y_min_int, y_max_int),
+        breaks = integer_axis_breaks(y_min_int, y_max_int)
+      ) +
       labs(x = "Sample", y = "Fold Change", title = paste(i, "Fold Change", sep = ", ")) +
       theme_bw() + gg_theme +
-      theme(axis.title.x = element_blank())
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 20)
+      )
 
     if (nrow(plot_df) == 2 && !is.na(plot_df$stars[1])) {
       p <- p +

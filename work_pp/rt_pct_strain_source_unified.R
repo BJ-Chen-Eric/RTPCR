@@ -24,6 +24,7 @@ print_usage <- function() {
     "  --control-gene GENE     Control gene name (auto: 5.8S then TUB)\n",
     "  --perform-calibration   true/false, apply cross-file Ct calibration (default: false)\n",
     "  --calibration-sample S  Sample_name used for calibration (auto: '*standard*' common across files)\n",
+    "  --calibration-rep N     Replicate index used for calibration Ct (optional)\n",
     "  --calibration-gene G    Gene used for calibration (default: control gene)\n",
     "  --calibration-time T    Time used for calibration (default: 0h)\n",
     "  --control-time T        Control time point for 2-time comparison (default: 0h)\n",
@@ -34,7 +35,7 @@ print_usage <- function() {
     "  --max-sample N          max_sample for drop_outliers_by_group (default: 3)\n",
     "  --sample-order CSV      Optional order for combined plots; unspecified strains are still included\n",
     "  --color COLOR           Direct plot color (hex like #1f77b4 or R color name like 'steelblue')\n",
-    "  --color-family NAME     Color family for random palette (red/blue/green/orange/purple/teal/pink/gray)\n",
+    "  --color-family NAMES    One family or comma-separated families (per-gene) from red/blue/green/orange/purple/teal/pink/gray\n",
     "  --color-seed N          Random seed for reproducible color palette (optional)\n",
     "  --color-count N         Number of colors to generate in the family palette (default: 12)\n",
     "  --color-index N         1-based color index from generated palette for bars (default: 1)\n",
@@ -104,6 +105,13 @@ parse_color_value <- function(x) {
     stop("Invalid --color value '", val, "'. Use hex like #1f77b4 or a valid R color name.")
   }
   val
+}
+
+parse_csv_values <- function(x) {
+  if (is.null(x)) return(character(0))
+  vals <- strsplit(as.character(x), ",", fixed = TRUE)[[1]]
+  vals <- trimws(vals)
+  vals[nzchar(vals)]
 }
 
 normalize_sample_name <- function(x) {
@@ -357,6 +365,21 @@ make_vertical_plot_grid <- function(plots) {
   cowplot::plot_grid(plotlist = plots, ncol = 1)
 }
 
+integer_axis_breaks <- function(y_min, y_max, max_ticks = 8) {
+  lo <- suppressWarnings(floor(as.numeric(y_min)))
+  hi <- suppressWarnings(ceiling(as.numeric(y_max)))
+  if (!is.finite(lo) || !is.finite(hi)) return(NULL)
+  if (lo == hi) return(lo)
+  span <- hi - lo
+  if (span <= 0) return(lo)
+  candidate_steps <- c(1, 2, 3, 4, 5, 10, 20, 25, 50, 100)
+  step <- candidate_steps[which.max((span / candidate_steps) <= max_ticks)]
+  if (!is.finite(step) || length(step) == 0 || step <= 0) {
+    step <- max(1, ceiling(span / max_ticks))
+  }
+  seq(lo, hi, by = step)
+}
+
 panel_name_from_result_key <- function(keys, mode = "auto", perspective = "miR") {
   meta <- header_cleaning(keys, "_")
   if (nrow(meta) == 0) return(character(0))
@@ -575,9 +598,11 @@ main <- function() {
   control_gene <- if (!is.null(control_gene_arg)) toupper(control_gene_arg) else NULL
   perform_calibration <- parse_bool(args$`perform-calibration`, default = FALSE)
   calibration_sample_user <- args$`calibration-sample`
+  calibration_rep_user <- args$`calibration-rep`
   calibration_gene_user <- args$`calibration-gene`
   calibration_time_user <- args$`calibration-time`
   calibration_sample <- if (!is.null(calibration_sample_user)) normalize_sample_name(calibration_sample_user) else NULL
+  calibration_rep <- parse_int(calibration_rep_user, default = NA_integer_)
   calibration_gene <- if (!is.null(calibration_gene_user)) toupper(calibration_gene_user) else NULL
   calibration_time <- if (!is.null(calibration_time_user)) calibration_time_user else "0h"
   control_time <- if (!is.null(args$`control-time`)) args$`control-time` else "0h"
@@ -603,7 +628,10 @@ main <- function() {
   max_sample <- parse_int(args$`max-sample`, default = 3)
   if (max_sample < 1) stop("--max-sample must be >= 1")
   color_value <- parse_color_value(args$color)
-  color_family <- if (!is.null(args$`color-family`)) tolower(trimws(args$`color-family`)) else "orange"
+  color_family_values <- parse_csv_values(args$`color-family`)
+  color_family_values <- tolower(color_family_values)
+  if (length(color_family_values) == 0) color_family_values <- "orange"
+  color_family <- color_family_values[[1]]
   color_seed <- parse_int(args$`color-seed`, default = NA_integer_)
   color_count <- parse_int(args$`color-count`, default = 12)
   color_index <- parse_int(args$`color-index`, default = 1)
@@ -660,7 +688,7 @@ main <- function() {
   message("[config] exclude_samples: ", ifelse(length(exclude_samples) == 0, "<none>", paste(exclude_samples, collapse = ", ")))
   message("[config] max_sample: ", max_sample)
   message("[config] color: ", ifelse(is.null(color_value), "<none>", color_value))
-  message("[config] color_family: ", color_family)
+  message("[config] color_family: ", paste(color_family_values, collapse = ", "))
   message("[config] color_seed: ", ifelse(is.finite(color_seed), as.character(color_seed), "<none>"))
   message("[config] color_count: ", color_count)
   message("[config] color_index: ", color_index)
@@ -673,7 +701,7 @@ main <- function() {
   bar_fill_color <- if (!is.null(color_value)) color_value else default_bar_fill_color
   utils::write.csv(color_palette, file.path(out_dir, "plot_color_index.csv"), row.names = FALSE)
   append_execution_log(
-    "plot_color_family=", color_family,
+    "plot_color_family=", paste(color_family_values, collapse = ","),
     ", selected_color_index=", color_index,
     ", palette_color=", default_bar_fill_color,
     ", final_plot_color=", bar_fill_color
@@ -811,44 +839,43 @@ main <- function() {
 
   message("[config] control_gene: ", control_gene)
   message("[config] calibration_sample: ", ifelse(is.null(calibration_sample), "<none>", calibration_sample))
+  message("[config] calibration_rep: ", ifelse(is.finite(calibration_rep), as.character(calibration_rep), "<none>"))
   message("[config] calibration_gene: ", calibration_gene)
   message("[config] calibration_time: ", calibration_time)
 
+  calibration_ct_mean <- function(df, sample_name, time_name, gene_name, rep_idx = NA_integer_) {
+    q <- df %>%
+      filter(
+        Sample_name == sample_name,
+        Time == time_name,
+        Gene == gene_name,
+        Ct != 100
+      )
+    if (is.finite(rep_idx)) q <- q %>% filter(rep == rep_idx)
+    mean(q$Ct, na.rm = TRUE)
+  }
+
   if (perform_calibration && length(filter_csv) > 1) {
     ref_name <- names(filter_csv)[1]
-    ref_ct <- filter_csv[[ref_name]] %>%
-      filter(
-        Sample_name == calibration_sample,
-        Time == calibration_time,
-        Gene == calibration_gene,
-        Ct != 100
-      ) %>%
-      pull(Ct) %>%
-      mean(na.rm = TRUE)
+    ref_ct <- calibration_ct_mean(filter_csv[[ref_name]], calibration_sample, calibration_time, calibration_gene, calibration_rep)
 
     if (!is.finite(ref_ct)) {
       stop(
         "Calibration failed: no valid reference Ct in file '", ref_name,
-        "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time
+        "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time,
+        if (is.finite(calibration_rep)) paste0(", rep=", calibration_rep) else ""
       )
     }
 
     for (k in 2:length(filter_csv)) {
       nm <- names(filter_csv)[k]
-      cur_ct <- filter_csv[[nm]] %>%
-        filter(
-          Sample_name == calibration_sample,
-          Time == calibration_time,
-          Gene == calibration_gene,
-          Ct != 100
-        ) %>%
-        pull(Ct) %>%
-        mean(na.rm = TRUE)
+      cur_ct <- calibration_ct_mean(filter_csv[[nm]], calibration_sample, calibration_time, calibration_gene, calibration_rep)
 
       if (!is.finite(cur_ct)) {
         stop(
           "Calibration failed: no valid Ct in file '", nm,
-          "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time
+          "' for sample=", calibration_sample, ", gene=", calibration_gene, ", time=", calibration_time,
+          if (is.finite(calibration_rep)) paste0(", rep=", calibration_rep) else ""
         )
       }
 
@@ -933,6 +960,43 @@ main <- function() {
   if (length(compare_times) == 0) {
     stop("No non-control time points detected. control_time=", control_time)
   }
+
+  gene_fill_color_map <- setNames(rep(bar_fill_color, length(identified_target_genes)), identified_target_genes)
+  if (length(identified_target_genes) > 0 && length(color_family_values) > 1 && is.null(color_value)) {
+    gene_families <- color_family_values
+    if (length(gene_families) < length(identified_target_genes)) {
+      message(
+        "[warn] --color-family has fewer entries than genes; families will be recycled. genes=",
+        length(identified_target_genes), ", families=", length(gene_families)
+      )
+      gene_families <- rep(gene_families, length.out = length(identified_target_genes))
+    } else if (length(gene_families) > length(identified_target_genes)) {
+      message(
+        "[warn] --color-family has more entries than genes; extras will be ignored. genes=",
+        length(identified_target_genes), ", families=", length(gene_families)
+      )
+      gene_families <- gene_families[seq_len(length(identified_target_genes))]
+    }
+
+    gene_fill_color_map <- setNames(vapply(seq_along(identified_target_genes), function(idx) {
+      fam <- gene_families[[idx]]
+      pal <- generate_family_palette(fam, color_count, color_seed)
+      pal$color_hex[[color_index]]
+    }, character(1)), identified_target_genes)
+  } else if (!is.null(color_value) && length(color_family_values) > 1) {
+    message("[warn] --color overrides multi-family --color-family; using one direct color for all genes.")
+  }
+
+  gene_color_table <- data.frame(
+    gene = names(gene_fill_color_map),
+    bar_fill_color = as.character(unname(gene_fill_color_map)),
+    stringsAsFactors = FALSE
+  )
+  utils::write.csv(gene_color_table, file.path(out_dir, "plot_gene_color_index.csv"), row.names = FALSE)
+  append_execution_log(
+    "gene_colors: ",
+    paste(paste0(gene_color_table$gene, "=", gene_color_table$bar_fill_color), collapse = ", ")
+  )
 
   result_raw <- list()
   for (t in time_points) {
@@ -1202,24 +1266,34 @@ main <- function() {
 
         ymax <- max(sub$mean_fc + ifelse(is.na(sub$sd_fc), 0, sub$sd_fc), na.rm = TRUE)
         if (!is.finite(ymax) || ymax <= 0) ymax <- 1
+        y_min_int <- 0
+        y_max_int <- ceiling(ymax * 1.2)
 
         fallback_strain_plots[[st]] <-
-          ggplot(sub, aes(x = panel_key, y = mean_fc)) +
-          geom_col(width = 0.6, fill = bar_fill_color) +
+          ggplot(sub, aes(x = panel_key, y = mean_fc, fill = miR)) +
+          geom_col(width = 0.6) +
           geom_errorbar(
             aes(ymin = pmax(0, mean_fc - ifelse(is.na(sd_fc), 0, sd_fc)),
                 ymax = mean_fc + ifelse(is.na(sd_fc), 0, sd_fc)),
             width = 0.15,
             linewidth = 0.8
           ) +
-          scale_y_continuous(limits = c(0, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+          scale_fill_manual(values = gene_fill_color_map, drop = FALSE) +
+          scale_y_continuous(
+            limits = c(y_min_int, y_max_int),
+            breaks = integer_axis_breaks(y_min_int, y_max_int)
+          ) +
           labs(
             x = "miR and Time",
             y = "2^-deltaCt",
             title = paste("Fallback (Strain)", toupper(st))
           ) +
           theme_bw() + gg_theme +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 20),
+            legend.title = element_blank()
+          )
       }
 
       for (nm in names(fallback_strain_plots)) {
@@ -1227,7 +1301,7 @@ main <- function() {
         save_plot_if_nonempty(
           fallback_strain_plots[[nm]],
           file.path(figure_dir, paste0("fallback_strain_", nm_safe, ".png")),
-          width = 10, height = 7
+          width = 16, height = 9
         )
       }
 
@@ -1261,10 +1335,12 @@ main <- function() {
   plot_df_list <- list()
   for (i in names(result_time_list)) {
     plot_df <- result_time_list[[i]] %>%
+      mutate(fold_change_num = suppressWarnings(as.numeric(fold_change))) %>%
       group_by(p) %>%
       summarise(
-        mean_fc = mean(fold_change, na.rm = TRUE),
-        sd_fc = sd(fold_change, na.rm = TRUE),
+        mean_fc = mean(fold_change_num, na.rm = TRUE),
+        sd_fc = sd(fold_change_num, na.rm = TRUE),
+        n_points = sum(is.finite(fold_change_num)),
         .groups = "drop"
       )
 
@@ -1311,6 +1387,8 @@ main <- function() {
 
     mir <- i %>% header_cleaning("_") %>% pull(V2)
     mir <- as.character(mir[1])
+    mir_fill_color <- gene_fill_color_map[[mir]]
+    if (is.null(mir_fill_color) || !nzchar(mir_fill_color)) mir_fill_color <- bar_fill_color
     limits <- y_limits_by_mir[[mir]]
     if (is.null(limits)) {
       ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
@@ -1319,17 +1397,19 @@ main <- function() {
       min_y <- limits[1]
       ymax <- limits[2]
     }
-    if (is.na(min_y) || min_y > -0.5) min_y <- -0.5
+    if (is.na(min_y) || min_y > -1) min_y <- -1
     if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
     if (!is.finite(ymax) || ymax <= 0) ymax <- 1
     y_span <- ymax - min_y
     if (!is.finite(y_span) || y_span <= 0) y_span <- 1
+    y_min_int <- floor(min_y)
+    y_max_int <- ceiling(ymax * 1.2)
 
     plot_df <- plot_df %>%
       mutate(
         time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+"))),
-        mean_label = sprintf("%.2f", mean_fc),
-        mean_label_y = -0.2
+        mean_label = sprintf("%.2f (n=%d)", mean_fc, n_points),
+        mean_label_y = -0.5
       ) %>%
       arrange(ifelse(str_detect(p, paste0("_", control_time, "$")), -Inf, time_num), p)
     plot_df$p <- factor(plot_df$p, levels = plot_df$p)
@@ -1342,7 +1422,7 @@ main <- function() {
 
     p <-
       ggplot(plot_df, aes(x = p, y = mean_fc)) +
-      geom_col(width = 0.6, fill = bar_fill_color) +
+      geom_col(width = 0.6, fill = mir_fill_color) +
       geom_point(
         data = raw_points,
         aes(x = p, y = fold_change_num),
@@ -1361,10 +1441,16 @@ main <- function() {
         aes(y = mean_label_y, label = mean_label),
         size = 6
       ) +
-      scale_y_continuous(limits = c(min_y, ymax * 1.2), breaks = scales::pretty_breaks(n = 5)) +
+      scale_y_continuous(
+        limits = c(y_min_int, y_max_int),
+        breaks = integer_axis_breaks(y_min_int, y_max_int)
+      ) +
       labs(x = "Sample", y = "Fold Change", title = paste(i, "Fold Change", sep = ", ")) +
       theme_bw() + gg_theme +
-      theme(axis.title.x = element_blank())
+      theme(
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 20)
+      )
 
     if (nrow(plot_df) == 2 && !is.na(plot_df$stars[1])) {
       p <- p +
