@@ -31,8 +31,11 @@ print_usage <- function() {
     "  --analysis-mode M       'auto', 'two', or 'multi' (default: auto)\n",
     "  --multi-compare-style S 'pairwise' or 'all_time' for multi mode (default: pairwise)\n",
     "  --sample-name-mode M    'auto' or 'strain_time' (default: auto)\n",
+    "  --target-genes CSV      Optional comma-separated target genes to analyze (e.g. 'MYB138,LOX45')\n",
     "  --exclude-samples CSV   Comma-separated sample names to exclude from analysis\n",
     "  --max-sample N          max_sample for drop_outliers_by_group (default: 3)\n",
+    "  --subset-topn-rules S   Optional rules: 'sample:gene:time:topN;...' (e.g. 's:MYB138:1:5', bottom: -5)\n",
+    "  --subset-topn-rules-control S Optional control rules for wide_reps_dt_c, same format as --subset-topn-rules\n",
     "  --sample-order CSV      Optional order for combined plots; unspecified strains are still included\n",
     "  --color COLOR           Direct plot color (hex like #1f77b4 or R color name like 'steelblue')\n",
     "  --color-family NAMES    One family or comma-separated families (per-gene) from red/blue/green/orange/purple/teal/pink/gray\n",
@@ -112,6 +115,87 @@ parse_csv_values <- function(x) {
   vals <- strsplit(as.character(x), ",", fixed = TRUE)[[1]]
   vals <- trimws(vals)
   vals[nzchar(vals)]
+}
+
+parse_subset_topn_rules <- function(x) {
+  if (is.null(x)) {
+    return(data.frame(sample = character(0), gene = character(0), time = numeric(0), top_n = integer(0), stringsAsFactors = FALSE))
+  }
+
+  raw <- trimws(as.character(x))
+  if (!nzchar(raw)) {
+    return(data.frame(sample = character(0), gene = character(0), time = numeric(0), top_n = integer(0), stringsAsFactors = FALSE))
+  }
+
+  rule_tokens <- unlist(strsplit(raw, "[;,]"))
+  rule_tokens <- trimws(rule_tokens)
+  rule_tokens <- rule_tokens[nzchar(rule_tokens)]
+  if (length(rule_tokens) == 0) {
+    return(data.frame(sample = character(0), gene = character(0), time = numeric(0), top_n = integer(0), stringsAsFactors = FALSE))
+  }
+
+  parsed <- lapply(rule_tokens, function(tok) {
+    parts <- trimws(strsplit(tok, ":", fixed = TRUE)[[1]])
+    if (length(parts) != 4) {
+      stop("Invalid --subset-topn-rules token '", tok, "'. Expected format sample:gene:time:topN")
+    }
+    time_num <- suppressWarnings(as.numeric(parts[[3]]))
+    top_n <- suppressWarnings(as.integer(parts[[4]]))
+    if (is.na(time_num)) stop("Invalid time in --subset-topn-rules token '", tok, "': ", parts[[3]])
+    if (is.na(top_n) || top_n == 0) stop("Invalid topN in --subset-topn-rules token '", tok, "': ", parts[[4]], " (cannot be 0)")
+    data.frame(
+      sample = tolower(parts[[1]]),
+      gene = toupper(parts[[2]]),
+      time = as.numeric(time_num),
+      top_n = as.integer(top_n),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  out <- dplyr::bind_rows(parsed)
+  if (nrow(out) == 0) {
+    return(data.frame(sample = character(0), gene = character(0), time = numeric(0), top_n = integer(0), stringsAsFactors = FALSE))
+  }
+  out %>%
+    dplyr::group_by(sample, gene, time) %>%
+    dplyr::summarise(top_n = dplyr::last(top_n), .groups = "drop")
+}
+
+select_topn_by_delta <- function(df, keep_n) {
+  if (nrow(df) == 0 || !is.finite(keep_n) || keep_n == 0) return(df)
+  if (keep_n > 0) return(dplyr::top_n(df, n = keep_n, wt = delta))
+  dplyr::top_n(df, n = keep_n, wt = delta)
+}
+
+apply_subset_topn_rule <- function(df, rules, sample_name, gene_name, time_num, analysis_mode, multi_compare_style) {
+  if (nrow(df) == 0 || nrow(rules) == 0) return(df)
+
+  hit <- rules %>%
+    dplyr::filter(
+      sample == tolower(sample_name),
+      gene == toupper(gene_name)
+    )
+  if (nrow(hit) == 0) return(df)
+
+  # In all_time mode, apply each rule to the corresponding hr subset inside df.
+  if (analysis_mode == "multi" && multi_compare_style == "all_time") {
+    out <- df
+    for (i in seq_len(nrow(hit))) {
+      target_hr <- as.numeric(hit$time[[i]])
+      keep_n <- as.integer(hit$top_n[[i]])
+      idx <- which(is.finite(as.numeric(out$hr)) & as.numeric(out$hr) == target_hr)
+      if (length(idx) == 0) next
+      kept <- select_topn_by_delta(out[idx, , drop = FALSE], keep_n)
+      out <- dplyr::bind_rows(out[-idx, , drop = FALSE], kept)
+    }
+    return(out)
+  }
+
+  if (!is.finite(time_num)) return(df)
+  hit_one <- hit %>% dplyr::filter(time == as.numeric(time_num))
+  if (nrow(hit_one) == 0) return(df)
+  keep_n <- hit_one$top_n[[1]]
+  select_topn_by_delta(df, keep_n)
 }
 
 normalize_sample_name <- function(x) {
@@ -583,7 +667,7 @@ main <- function() {
   }
 
   source(file.path(script_dir, "functions_rt.R"))
-  ensure_packages(c("tidyr", "tibble", "openxlsx", "cowplot", "scales"))
+  ensure_packages(c("tidyr", "tibble", "openxlsx", "cowplot", "scales", "ggtext"))
   suppressPackageStartupMessages({
     library(dplyr)
     library(stringr)
@@ -636,6 +720,11 @@ main <- function() {
   if (!(sample_name_mode %in% c("auto", "strain_time"))) {
     stop("--sample-name-mode must be one of: auto, strain_time")
   }
+  target_genes <- parse_csv_values(args$`target-genes`)
+  target_genes <- toupper(target_genes)
+  target_genes <- target_genes[nzchar(target_genes)]
+  target_genes <- target_genes[!target_genes %in% c("5.8S", "U6")]
+  target_genes <- unique(target_genes)
   exclude_samples <- character(0)
   if (!is.null(args$`exclude-samples`)) {
     exclude_samples <- strsplit(args$`exclude-samples`, ",", fixed = TRUE)[[1]]
@@ -644,6 +733,8 @@ main <- function() {
   }
   max_sample <- parse_int(args$`max-sample`, default = 3)
   if (max_sample < 1) stop("--max-sample must be >= 1")
+  subset_topn_rules <- parse_subset_topn_rules(args$`subset-topn-rules`)
+  subset_topn_rules_control <- parse_subset_topn_rules(args$`subset-topn-rules-control`)
   color_value <- parse_color_value(args$color)
   color_family_values <- parse_csv_values(args$`color-family`)
   color_family_values <- tolower(color_family_values)
@@ -702,8 +793,32 @@ main <- function() {
   message("[config] analysis_mode: ", analysis_mode)
   message("[config] multi_compare_style: ", multi_compare_style)
   message("[config] sample_name_mode: ", sample_name_mode)
+  message("[config] target_genes: ", ifelse(length(target_genes) == 0, "<auto/all>", paste(target_genes, collapse = ", ")))
   message("[config] exclude_samples: ", ifelse(length(exclude_samples) == 0, "<none>", paste(exclude_samples, collapse = ", ")))
   message("[config] max_sample: ", max_sample)
+  if (nrow(subset_topn_rules) == 0) {
+    message("[config] subset_topn_rules: <none>")
+  } else {
+    rule_text <- paste0(subset_topn_rules$sample, ":", subset_topn_rules$gene, ":", subset_topn_rules$time, ":", subset_topn_rules$top_n)
+    message("[config] subset_topn_rules: ", paste(rule_text, collapse = "; "))
+  }
+  if (nrow(subset_topn_rules_control) == 0) {
+    message("[config] subset_topn_rules_control: <none>")
+  } else {
+    rule_text_c <- paste0(subset_topn_rules_control$sample, ":", subset_topn_rules_control$gene, ":", subset_topn_rules_control$time, ":", subset_topn_rules_control$top_n)
+    message("[config] subset_topn_rules_control: ", paste(rule_text_c, collapse = "; "))
+  }
+  requested_topn_values <- c(
+    if (nrow(subset_topn_rules) > 0) abs(subset_topn_rules$top_n) else numeric(0),
+    if (nrow(subset_topn_rules_control) > 0) abs(subset_topn_rules_control$top_n) else numeric(0)
+  )
+  if (length(requested_topn_values) > 0 && max(requested_topn_values, na.rm = TRUE) > max_sample) {
+    message(
+      "[warn] Some subset topN values exceed --max-sample=", max_sample,
+      ". Outlier filtering can reduce rows before/after subsetting. ",
+      "If you expect up to N rows retained, set --max-sample >= N."
+    )
+  }
   message("[config] color: ", ifelse(is.null(color_value), "<none>", color_value))
   message("[config] color_family: ", paste(color_family_values, collapse = ", "))
   message("[config] color_seed: ", ifelse(is.finite(color_seed), as.character(color_seed), "<none>"))
@@ -711,6 +826,23 @@ main <- function() {
   message("[config] color_index: ", color_index)
   append_execution_log("Pipeline started")
   append_execution_log("analysis_mode=", analysis_mode, ", multi_compare_style=", multi_compare_style, ", control_time=", control_time)
+  append_execution_log("target_genes=", ifelse(length(target_genes) == 0, "<auto/all>", paste(target_genes, collapse = ",")))
+  append_execution_log(
+    "subset_topn_rules=",
+    ifelse(
+      nrow(subset_topn_rules) == 0,
+      "<none>",
+      paste0(subset_topn_rules$sample, ":", subset_topn_rules$gene, ":", subset_topn_rules$time, ":", subset_topn_rules$top_n, collapse = ";")
+    )
+  )
+  append_execution_log(
+    "subset_topn_rules_control=",
+    ifelse(
+      nrow(subset_topn_rules_control) == 0,
+      "<none>",
+      paste0(subset_topn_rules_control$sample, ":", subset_topn_rules_control$gene, ":", subset_topn_rules_control$time, ":", subset_topn_rules_control$top_n, collapse = ";")
+    )
+  )
   append_execution_log("input_files(", length(selected_file_paths), "): ", paste(basename(selected_file_paths), collapse = ", "))
 
   color_palette <- generate_family_palette(color_family, color_count, color_seed)
@@ -917,6 +1049,22 @@ main <- function() {
       p_filter = paste(p_filter, data_resoure, rep, sep = "_")
     )
 
+  if (length(target_genes) > 0) {
+    available_target_genes <- sort(unique(all$Gene[!(all$Gene %in% c(control_gene, "5.8S", "U6", ""))]))
+    missing_target_genes <- setdiff(target_genes, available_target_genes)
+    if (length(missing_target_genes) > 0) {
+      stop(
+        "Requested --target-genes not found in selected files: ",
+        paste(missing_target_genes, collapse = ", "),
+        ". Available target genes include: ",
+        paste(head(available_target_genes, 20), collapse = ", "),
+        if (length(available_target_genes) > 20) " ..." else ""
+      )
+    }
+    all <- all %>% filter(Gene %in% c(control_gene, target_genes))
+    message("[filter] applied --target-genes; kept target genes: ", paste(target_genes, collapse = ", "))
+  }
+
   # Fail early when a sample-time has target genes but no control gene.
   pair_check <- all %>%
     group_by(p) %>%
@@ -1108,43 +1256,108 @@ main <- function() {
 
         wide_reps_dt_c <- as.data.table(wide_reps_dt[wide_reps_dt$hr == c_num, ])
         if (nrow(wide_reps_dt_c) == 0) next
-        if (length(unique(wide_reps_dt_c$data_resoure)) != 1) {
-          wide_reps_dt_c <- wide_reps_dt_c %>% filter(data_resoure != "20260108tcp43")
-        }
+
+        # Match sample flow: apply control subset rules before outlier max-sample filtering.
+        n_c_before_rule <- nrow(wide_reps_dt_c)
+        wide_reps_dt_c <- apply_subset_topn_rule(
+          wide_reps_dt_c,
+          subset_topn_rules_control,
+          sample_name = s1,
+          gene_name = g,
+          time_num = c_num,
+          analysis_mode = analysis_mode,
+          multi_compare_style = multi_compare_style
+        )
         if (nrow(wide_reps_dt_c) == 0) next
+        if (nrow(subset_topn_rules_control) > 0) {
+          matched_c <- subset_topn_rules_control %>%
+            dplyr::filter(sample == tolower(s1), gene == toupper(g), time == as.numeric(c_num))
+          if (nrow(matched_c) > 0) {
+            append_execution_log(
+              "rule_control_applied sample=", s1,
+              ", gene=", g,
+              ", hr=", c_num,
+              ", topN=", matched_c$top_n[[1]],
+              ", rows_before=", n_c_before_rule,
+              ", rows_after=", nrow(wide_reps_dt_c)
+            )
+          }
+        }
 
         wide_reps_dt_c$dis <- wide_reps_dt_c$delta - median(wide_reps_dt_c$delta)
         wide_reps_dt_c <- wide_reps_dt_c %>%
           arrange(abs(dis)) %>%
           mutate(
-            center = median(delta),
-            mad = mad(delta, constant = 1),
-            z_score = (delta - center) / mad,
+            center = mean(delta, na.rm = TRUE),
+            delta_sd = sd(delta, na.rm = TRUE),
+            z_score = ifelse(is.finite(delta_sd) & delta_sd > 0, (delta - center) / delta_sd, 0),
             n = sum(!is.na(delta))
           ) %>%
           arrange(abs(z_score)) %>%
           distinct(rep, .keep_all = TRUE) %>%
-          select(-c(center, mad, z_score, n, dis))
+          select(-c(center, delta_sd, z_score, n, dis))
 
         wide_reps_dt_s <- as.data.table(wide_reps_dt[wide_reps_dt$hr != c_num & wide_reps_dt$hr %in% hr_keep, ])
         if (nrow(wide_reps_dt_s) == 0) next
-        if (length(unique(wide_reps_dt_s$data_resoure)) != 1) {
-          wide_reps_dt_s <- wide_reps_dt_s %>% filter(data_resoure != "20260108tcp43")
-        }
+        # Match legacy behavior: apply manual top/bottom-N rule before z-score based pruning.
+        n_s_before_rule <- nrow(wide_reps_dt_s)
+        wide_reps_dt_s <- apply_subset_topn_rule(
+          wide_reps_dt_s,
+          subset_topn_rules,
+          sample_name = s1,
+          gene_name = g,
+          time_num = t_num,
+          analysis_mode = analysis_mode,
+          multi_compare_style = multi_compare_style
+        )
         if (nrow(wide_reps_dt_s) == 0) next
+        if (nrow(subset_topn_rules) > 0) {
+          matched_s <- subset_topn_rules %>% dplyr::filter(sample == tolower(s1), gene == toupper(g))
+          if (nrow(matched_s) > 0) {
+            append_execution_log(
+              "rule_sample_applied sample=", s1,
+              ", gene=", g,
+              ", rows_before=", n_s_before_rule,
+              ", rows_after=", nrow(wide_reps_dt_s),
+              ", matched_rules=",
+              paste0(matched_s$time, ":", matched_s$top_n, collapse = ";")
+            )
+          }
+        }
 
-        wide_reps_dt_s$dis <- wide_reps_dt_s$delta - median(wide_reps_dt_s$delta)
-        wide_reps_dt_s <- wide_reps_dt_s %>%
-          arrange(abs(dis)) %>%
-          mutate(
-            center = median(delta),
-            mad = mad(delta, constant = 1),
-            z_score = abs((delta - center) / mad),
-            n = sum(!is.na(delta))
-          ) %>%
-          arrange(abs(z_score)) %>%
-          distinct(if (analysis_mode == "multi" && multi_compare_style == "all_time") paste(rep, hr) else rep, .keep_all = TRUE) %>%
-          select(-c(center, mad, z_score, n, dis))
+        if (analysis_mode == "multi" && multi_compare_style == "all_time") {
+          # Legacy loop computed this per timepoint; in all_time mode emulate that by hr.
+          wide_reps_dt_s <- wide_reps_dt_s %>%
+            group_by(hr) %>%
+            group_modify(function(.x, .y) {
+              .x$dis <- .x$delta - median(.x$delta)
+              .x %>%
+                arrange(abs(dis)) %>%
+                mutate(
+                  center = mean(delta, na.rm = TRUE),
+                  delta_sd = sd(delta, na.rm = TRUE),
+                  z_score = ifelse(is.finite(delta_sd) & delta_sd > 0, abs((delta - center) / delta_sd), 0),
+                  n = sum(!is.na(delta))
+                ) %>%
+                arrange(abs(z_score)) %>%
+                distinct(rep, .keep_all = TRUE) %>%
+                select(-c(center, delta_sd, z_score, n, dis))
+            }) %>%
+            ungroup()
+        } else {
+          wide_reps_dt_s$dis <- wide_reps_dt_s$delta - median(wide_reps_dt_s$delta)
+          wide_reps_dt_s <- wide_reps_dt_s %>%
+            arrange(abs(dis)) %>%
+            mutate(
+              center = mean(delta, na.rm = TRUE),
+              delta_sd = sd(delta, na.rm = TRUE),
+              z_score = ifelse(is.finite(delta_sd) & delta_sd > 0, abs((delta - center) / delta_sd), 0),
+              n = sum(!is.na(delta))
+            ) %>%
+            arrange(abs(z_score)) %>%
+            distinct(rep, .keep_all = TRUE) %>%
+            select(-c(center, delta_sd, z_score, n, dis))
+        }
 
         key <- paste(s1, g, sep = "_")
         if (key %in% c("xxx")) {
@@ -1250,28 +1463,38 @@ main <- function() {
     nrow(analysis_tables$sample_gene_status)
   )
 
-  # Pairwise time-point tests for each strain-gene across all detected times.
-  c_num <- suppressWarnings(as.numeric(str_extract(control_time, "[0-9]+")))
-  pairwise_input <- all_time %>%
-    filter(is.finite(con), is.finite(gene), con < 40, gene < 40) %>%
-    mutate(
-      hr = suppressWarnings(as.numeric(hr)),
-      time_label = ifelse(is.finite(hr), paste0(as.integer(hr), "h"), as.character(hr)),
-      pre_fold_change = 2^(-delta)
-    ) %>%
-    filter(is.finite(hr), nzchar(time_label))
+  # Pairwise tests should use the same filtered rows used for final plots/results.
+  pairwise_input <- data.frame()
+  if (length(result_time_list) > 0) {
+    pairwise_input_list <- list()
+    keep_cols <- c("p", "data_resoure", "rep", "hr", "fold_change")
+    for (nm in names(result_time_list)) {
+      df <- result_time_list[[nm]]
+      if (is.null(df) || nrow(df) == 0) next
+      if (!all(keep_cols %in% colnames(df))) next
 
-  if (nrow(pairwise_input) > 0 && is.finite(c_num)) {
-    pairwise_input <- pairwise_input %>%
-      group_by(strain, miR) %>%
-      mutate(
-        control = mean(pre_fold_change[hr == c_num], na.rm = TRUE),
-        fold_change = pre_fold_change / control
-      ) %>%
-      ungroup() %>%
-      filter(is.finite(fold_change))
-  } else {
-    pairwise_input$fold_change <- NA_real_
+      meta_nm <- header_cleaning(nm, "_")
+      if (nrow(meta_nm) == 0 || !all(c("V1", "V2") %in% colnames(meta_nm))) next
+      strain_name <- as.character(meta_nm$V1[1])
+      gene_name <- as.character(meta_nm$V2[1])
+
+      pairwise_input_list[[nm]] <- df %>%
+        transmute(
+          strain = strain_name,
+          miR = gene_name,
+          p = as.character(p),
+          data_resoure = as.character(data_resoure),
+          rep = suppressWarnings(as.integer(rep)),
+          hr = suppressWarnings(as.numeric(hr)),
+          fold_change = suppressWarnings(as.numeric(fold_change))
+        )
+    }
+
+    if (length(pairwise_input_list) > 0) {
+      pairwise_input <- dplyr::bind_rows(pairwise_input_list) %>%
+        filter(is.finite(hr), is.finite(fold_change)) %>%
+        distinct(strain, miR, p, data_resoure, rep, hr, fold_change, .keep_all = TRUE)
+    }
   }
 
   pairwise_rows <- list()
@@ -1385,12 +1608,21 @@ main <- function() {
       heatmap_df <- dplyr::bind_rows(heatmap_rows, .id = "panel") %>%
         mutate(
           panel = gsub("_", "-", panel),
-          p_plot = p_value
+          p_plot = p_value,
+          strain = as.character(strain),
+          gene = as.character(gene)
         )
 
-      panel_n <- dplyr::n_distinct(heatmap_df$panel)
-      ncol_wrap <- max(1, min(4, ceiling(sqrt(panel_n))))
-      nrow_wrap <- ceiling(panel_n / ncol_wrap)
+      strain_levels <- sort(unique(heatmap_df$strain))
+      gene_levels <- sort(unique(heatmap_df$gene))
+      heatmap_df <- heatmap_df %>%
+        mutate(
+          strain = factor(strain, levels = strain_levels),
+          gene = factor(gene, levels = gene_levels)
+        )
+
+      nrow_grid <- length(strain_levels)
+      ncol_grid <- length(gene_levels)
       heatmap_plot <- ggplot(heatmap_df, aes(x = time_a, y = time_b, fill = p_plot)) +
         geom_tile(color = "white", linewidth = 0.3) +
         geom_text(aes(label = p_stars), size = 4) +
@@ -1409,7 +1641,7 @@ main <- function() {
             barwidth = grid::unit(0.8, "cm")
           )
         ) +
-        facet_wrap(~panel, ncol = ncol_wrap) +
+        facet_grid(strain ~ gene) +
         labs(
           x = "Time",
           y = "Time",
@@ -1422,13 +1654,14 @@ main <- function() {
           axis.text.x = element_text(angle = 0, hjust = 1),
           axis.title.x = element_blank(),
           axis.title.y = element_blank(),
+          strip.text.y = element_text(angle = 0),
           panel.grid = element_blank()
         )
       save_plot_if_nonempty(
         heatmap_plot,
         file.path(figure_dir, "pairwise_time_test_heatmap.png"),
-        width = max(10, 4.5 * ncol_wrap),
-        height = max(6, 3.8 * nrow_wrap)
+        width = max(10, 3.8 * ncol_grid),
+        height = max(6, 3.8 * nrow_grid)
       )
     }
 
@@ -1570,24 +1803,6 @@ main <- function() {
   }
 
   plot_list <- list()
-  y_limits_by_mir <- list()
-  for (nm in names(plot_df_list)) {
-    meta_nm <- header_cleaning(nm, "_")
-    if (nrow(meta_nm) == 0 || !("V2" %in% colnames(meta_nm))) next
-    mir_nm <- as.character(meta_nm$V2[1])
-    y_top <- max(plot_df_list[[nm]]$y_max, na.rm = TRUE)
-    y_bottom <- min(plot_df_list[[nm]]$mean_fc - plot_df_list[[nm]]$sd_fc, na.rm = TRUE)
-    if (!is.finite(y_top)) y_top <- 1
-    if (!is.finite(y_bottom)) y_bottom <- -0.5
-    if (is.null(y_limits_by_mir[[mir_nm]])) {
-      y_limits_by_mir[[mir_nm]] <- c(y_bottom, y_top)
-    } else {
-      y_limits_by_mir[[mir_nm]] <- c(
-        min(y_limits_by_mir[[mir_nm]][1], y_bottom, na.rm = TRUE),
-        max(y_limits_by_mir[[mir_nm]][2], y_top, na.rm = TRUE)
-      )
-    }
-  }
 
   for (i in names(plot_df_list)) {
     plot_df <- plot_df_list[[i]]
@@ -1597,30 +1812,30 @@ main <- function() {
     mir <- as.character(mir[1])
     mir_fill_color <- gene_fill_color_map[[mir]]
     if (is.null(mir_fill_color) || !nzchar(mir_fill_color)) mir_fill_color <- bar_fill_color
-    limits <- y_limits_by_mir[[mir]]
-    if (is.null(limits)) {
-      ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
-      min_y <- min(plot_df$mean_fc - plot_df$sd_fc, na.rm = TRUE)
-    } else {
-      min_y <- limits[1]
-      ymax <- limits[2]
-    }
-    if (is.na(min_y) || min_y > -1) min_y <- -1
+    ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
+    min_y <- min(plot_df$mean_fc - plot_df$sd_fc, na.rm = TRUE)
+    if (is.na(min_y) || min_y < -0.5) min_y <- -1
     if (!is.finite(ymax) || ymax <= 0) ymax <- max(plot_df$mean_fc + plot_df$sd_fc, na.rm = TRUE)
     if (!is.finite(ymax) || ymax <= 0) ymax <- 1
     y_span <- ymax - min_y
     if (!is.finite(y_span) || y_span <= 0) y_span <- 1
-    y_min_int <- floor(min_y)
-    y_max_int <- ceiling(ymax * 1.2)
+    y_min_int <- 0
+    y_max_int <- round(ymax * 1.2, digit=1)
 
     plot_df <- plot_df %>%
       mutate(
         time_num = suppressWarnings(as.numeric(str_extract(p, "[0-9]+"))),
-        mean_label = sprintf("%.2f (n=%d)", mean_fc, n_points),
-        mean_label_y = -0.5
+        mean_label = sprintf("%.2f (n=%d)", mean_fc, n_points)
       ) %>%
       arrange(ifelse(str_detect(p, paste0("_", control_time, "$")), -Inf, time_num), p)
     plot_df$p <- factor(plot_df$p, levels = plot_df$p)
+    x_labels <- setNames(
+      paste0(
+        "<span>", as.character(plot_df$p), "</span><br>",
+        "<span style='font-size:18pt;'>", plot_df$mean_label, "</span>"
+      ),
+      as.character(plot_df$p)
+    )
     raw_points <- result_time_list[[i]] %>%
       mutate(
         fold_change_num = suppressWarnings(as.numeric(fold_change)),
@@ -1645,18 +1860,17 @@ main <- function() {
         width = 0.15,
         linewidth = 0.8
       ) +
-      geom_text(
-        aes(y = mean_label_y, label = mean_label),
-        size = 6
-      ) +
+      scale_x_discrete(labels = x_labels) +
       scale_y_continuous(
         limits = c(y_min_int, y_max_int),
-        breaks = integer_axis_breaks(y_min_int, y_max_int)
+        breaks = integer_axis_breaks(0, y_max_int, 8),
+        expand = expansion(mult = c(0, 0.03))
       ) +
       labs(x = "Sample", y = "Fold Change", title = paste(i, "Fold Change", sep = ", ")) +
       theme_bw() + gg_theme +
       theme(
         axis.title.x = element_blank(),
+        axis.text.x = ggtext::element_markdown(lineheight = 1.05),
         axis.text.y = element_text(size = 20)
       )
 
