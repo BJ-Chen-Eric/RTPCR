@@ -130,13 +130,13 @@ write_fasta <-
 
 
 gg_theme= theme(
-  title = element_text(size = 30-10),
-  axis.title.x = element_text(size = 28),
-  axis.text.x = element_text(size = 18+4), # -6, angle=90,hjust=0.95,vjust=0.2
-  axis.title.y = element_text(size = 28),
-  axis.text.y = element_text(size = 18+4),
-  plot.subtitle = element_text(size = 24-8),
-  plot.caption = element_text(size = 30), 
+  title = element_text(size = 36),
+  axis.title.x = element_text(size = 30),
+  axis.text.x = element_text(size = 28), # -6, angle=90,hjust=0.95,vjust=0.2
+  axis.title.y = element_text(size = 30),
+  axis.text.y = element_text(size = 28),
+  plot.subtitle = element_text(size = 28),
+  plot.caption = element_text(size = 32), 
   legend.text = element_text(size = 16+4), 
   legend.key.size = unit(4, 'lines'), 
   legend.key.height = unit(1, "cm"),
